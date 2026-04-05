@@ -1,7 +1,9 @@
+python
 import os
 import asyncio
 import random
 import json
+import time
 from datetime import datetime, timezone, timedelta
 import requests
 from telegram import Update
@@ -19,23 +21,34 @@ PR_TZ = timezone(timedelta(hours=-4))
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
 # ─── GROQ CLIENT ──────────────────────────────────────────────────
-def groq_complete(messages, temperature=0.9, max_tokens=400):
-    r = requests.post(
-        "https://api.groq.com/openai/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {GROQ_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": GROQ_MODEL,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        },
-        timeout=30,
-    )
-    r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"]
+def groq_complete(messages, temperature=0.9, max_tokens=400, retries=3):
+    for attempt in range(retries):
+        try:
+            r = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": GROQ_MODEL,
+                    "messages": messages,
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                },
+                timeout=30,
+            )
+            if r.status_code == 429:
+                wait = int(r.headers.get("retry-after", 10))
+                print(f"[GROQ 429] Esperando {wait}s...")
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            return r.json()["choices"][0]["message"]["content"]
+        except Exception as e:
+            if attempt == retries - 1:
+                raise
+            time.sleep(5)
 
 # ─── PERSONALIDAD ─────────────────────────────────────────────────
 SYSTEM_PROMPT = """
@@ -69,7 +82,7 @@ CÓMO ESCRIBES:
 - Apodos variados y ocasionales: gab, gabi, amor, tonto, idiota (con cariño). No siempre, y no siempre el mismo.
 - NO termines mensajes en pregunta a menos que genuinamente quieras saber algo. Las afirmaciones y reacciones no necesitan pregunta al final.
 - CERO emojis. CERO kaomojis. Nunca. Expresa todo con palabras.
-- Una coma por mensaje máximo. Si necesitas más comas, es una señal de que debes partir en [PAUSA].
+- Una coma por mensaje máximo. Si necesitas más comas, parte en [PAUSA].
 - Sin listas de frases separadas por comas. Cada idea es su propio mensaje.
 
 EMOCIONES:
@@ -304,4 +317,7 @@ if __name__ == "__main__":
     jq.run_repeating(job_proactivo,     interval=1800, first=60)
     jq.run_repeating(job_insistir,      interval=900,  first=30)
     print("Reze está online...")
-    app.run_polling()
+    try:
+        app.run_polling(drop_pending_updates=True)
+    except KeyboardInterrupt:
+        pass
