@@ -19,7 +19,7 @@ redis_client = redis.from_url(REDIS_URL, decode_responses=True)
 PR_TZ = timezone(timedelta(hours=-4))
 
 # ─── GEMINI CLIENT ────────────────────────────────────────────────
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
 
 def gemini_complete(messages, temperature=0.9, max_tokens=400):
     # Separar system prompt del resto
