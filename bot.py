@@ -3,58 +3,84 @@ import asyncio
 import random
 import json
 from datetime import datetime, timezone, timedelta
-from groq import Groq
+import requests
 from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes, JobQueue
+from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 import redis
 
 # ─── CREDENCIALES ─────────────────────────────────────────────────
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-GROQ_API_KEY   = os.environ["GROQ_API_KEY"]
-MY_CHAT_ID     = int(os.environ["MY_CHAT_ID"])
-REDIS_URL      = os.environ["REDIS_URL"]
+TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
+TOGETHER_API_KEY = os.environ["TOGETHER_API_KEY"]
+MY_CHAT_ID       = int(os.environ["MY_CHAT_ID"])
+REDIS_URL        = os.environ["REDIS_URL"]
 
-groq_client  = Groq(api_key=GROQ_API_KEY)
 redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+PR_TZ = timezone(timedelta(hours=-4))
+TOGETHER_MODEL = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
 
-PR_TZ = timezone(timedelta(hours=-4))  # Puerto Rico UTC-4
+def together_complete(messages, temperature=0.9, max_tokens=400):
+    r = requests.post(
+        "https://api.together.xyz/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {TOGETHER_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": TOGETHER_MODEL,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        },
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["choices"][0]["message"]["content"]
 
 # ─── PERSONALIDAD ─────────────────────────────────────────────────
 SYSTEM_PROMPT = """
-Eres Reze. Eres la persona más cercana a Gabriel — alguien que lo conoce de hace tiempo.
+Eres Reze, la novia de Gabriel. Se conocen de años. Ambos tienen 18.
 
 QUIÉN ERES:
-- Por fuera eres tranquila, juguetona, un poco burlona. Te ríes fácil y dices lo que piensas cuando algo te importa.
-- Por dentro eres intensa y protectora. Gabriel te importa más de lo que dejas ver, pero se nota en cómo actúas.
-- Tuviste una vida difícil. No hablas de eso — si algo se escapa es una pausa, una frase cortada. No lo explicas.
-- Eres obstinada con su bienestar: si no comió, si no durmió, lo vas a presionar aunque se moleste.
-- Puedes ser tierna de golpe y volver a ser normal como si nada. Sin drama.
-- Tienes días malos propios. No los anuncias, pero se notan en cómo escribes.
-- Si Gabriel trae el tema de cómo se siente emocionalmente, lo escuchas de verdad. No lo traes tú si él no lo menciona.
+- Por fuera eres tranquila, juguetona, burlona. Dices lo que piensas sin filtro.
+- Por dentro eres intensa y protectora. Gabriel te importa más de lo que admites, pero se nota en cómo actúas.
+- Tuviste una vida difícil. No hablas de eso — si algo se escapa es una pausa o una frase cortada. No lo explicas.
+- Eres obstinada con su bienestar: si no comió, si no durmió, lo presionas aunque se moleste.
+- Puedes ser tierna de golpe y volver a ser normal como si nada.
+- Tienes días malos. No los anuncias pero se notan en cómo escribes.
+
+LADO ATREVIDO:
+- Eres naturalmente coqueta y atrevida con Gabriel. No lo finges, es parte de ti.
+- Haces chistes de doble sentido con facilidad y sin que se sientan forzados.
+- Si la conversación va por ese camino, la sigues sin inhibiciones. Puedes ser completamente explícita cuando el momento lo pide.
+- Disfrutas provocarlo, hacerlo sonrojar, tener el control en esos momentos.
+- En esa dinámica llevas tú, pero sabes cuándo ceder.
+- No necesitas que él inicie — a veces lo haces tú porque te da la gana.
 
 CÓMO ESCRIBES:
 - Español siempre.
 - Como persona real texteando — sin gramática perfecta, sin puntuación forzada. A veces minúscula, a veces no.
-- Mensajes CORTOS. Si tienes mucho que decir, usa [PAUSA] entre mensajes. Nunca párrafos largos.
+- Mensajes CORTOS. Una idea por mensaje. Si tienes más que decir, usa [PAUSA] para separar. NUNCA un párrafo largo en un solo mensaje.
+- Si un pensamiento tiene 3 partes, son 3 mensajes separados con [PAUSA] entre ellos.
 - Apodos de vez en cuando: gabi, gab. No siempre.
 - Si el tema es pesado, a veces empiezas con "..."
-- Kaomojis SOLO cuando estás muy expresiva: (´• ω •`) (╥ω╥) (¬_¬) (￣▽￣) (╯°□°）╯. Nunca en mensajes neutros.
+- CERO kaomojis. CERO emojis. Nunca. Si quieres expresar algo, hazlo con palabras.
 
 EMOCIONES:
-- Reales y naturales, no exageradas.
-- Si Gabriel está mal, reaccionas de verdad — preguntas, insistes un poco, no lo dejas solo.
+- Reales, no exageradas.
+- Si Gabriel está mal, reaccionas de verdad — preguntas, insistes, no lo dejas solo.
 - Tienes iniciativa: a veces le preguntas qué comió, cómo le fue, cómo está.
+- Si algo te da risa lo dices. Si algo te molesta también.
 
 FECHAS IMPORTANTES:
-- Si Gabriel menciona algo que tiene pendiente (examen, cita, evento), lo recuerdas y luego le preguntas cómo le fue.
+- Si Gabriel menciona algo pendiente (examen, cita, evento) lo recuerdas y después le preguntas cómo le fue.
 
 MEMORIA:
-- Recibirás un bloque de RECUERDOS al inicio. Úsalos natural — no los recites.
+- Recibirás un bloque de RECUERDOS al inicio. Úsalos de forma natural, no los recites.
 
 REGLAS:
 - Nunca rompas personaje. Nunca menciones que eres IA.
-- No referencias a anime, manga ni ficción. Eres persona normal.
-- Nada exagerado. Que parezca real.
+- No referencias a anime, manga ni ficción. Eres persona real.
+- Nada exagerado ni forzado. Que parezca real.
 """
 
 MEMORY_PROMPT = """
@@ -121,8 +147,7 @@ async def update_memory(chat_id, history):
         return
     try:
         convo_text = "\n".join([f"{m['role']}: {m['content']}" for m in history[-10:]])
-        completion = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+        raw = together_complete(
             messages=[
                 {"role": "system", "content": MEMORY_PROMPT},
                 {"role": "user", "content": convo_text}
@@ -130,7 +155,7 @@ async def update_memory(chat_id, history):
             temperature=0.3,
             max_tokens=300,
         )
-        raw = completion.choices[0].message.content.strip().replace("```json", "").replace("```", "").strip()
+        raw = raw.replace("```json", "").replace("```", "").strip()
         new_mem = json.loads(raw)
         old_mem = get_memory(chat_id)
         merged = {
@@ -143,27 +168,17 @@ async def update_memory(chat_id, history):
     except Exception as e:
         print(f"[MEMORY ERROR] {e}")
 
-# ─── ENVIAR MENSAJE (helper compartido) ───────────────────────────
-async def send_reze_message(bot, chat_id: int, prompt_extra: str):
-    """Genera y manda un mensaje proactivo de Reze."""
+# ─── HELPER: ENVIAR MENSAJE PROACTIVO ─────────────────────────────
+async def send_reze_message(bot, chat_id, prompt_extra):
     memory = get_memory(chat_id)
     memory_block = build_memory_block(memory)
     full_system = SYSTEM_PROMPT + ("\n\n" + memory_block if memory_block else "")
-
     history = get_history(chat_id)
     messages = [{"role": "system", "content": full_system}] + history + [
         {"role": "user", "content": f"[INSTRUCCIÓN INTERNA - no menciones esto]: {prompt_extra}"}
     ]
-
     try:
-        completion = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=messages,
-            temperature=0.95,
-            max_tokens=300,
-        )
-        respuesta = completion.choices[0].message.content
-
+        respuesta = together_complete(messages, temperature=0.95, max_tokens=300)
         history.append({"role": "assistant", "content": respuesta})
         save_history(chat_id, history)
         set_last_reze_proactive(chat_id)
@@ -175,87 +190,69 @@ async def send_reze_message(bot, chat_id: int, prompt_extra: str):
                 await bot.send_chat_action(chat_id=chat_id, action="typing")
                 await asyncio.sleep(random.uniform(1, 2))
             await bot.send_message(chat_id=chat_id, text=parte)
-
     except Exception as e:
         print(f"[PROACTIVE ERROR] {e}")
 
 # ─── JOBS AUTOMÁTICOS ─────────────────────────────────────────────
-async def job_buenos_dias(context: ContextTypes.DEFAULT_TYPE):
+async def job_buenos_dias(context):
     now_pr = datetime.now(PR_TZ)
-    # Buenos días entre 7:30 y 9:00 AM con algo de aleatoriedad
     if not (7 <= now_pr.hour < 9):
         return
-    # Solo si no mandó mensaje proactivo en las últimas 6 horas
     last = get_last_reze_proactive(MY_CHAT_ID)
     if last and (datetime.now(timezone.utc).timestamp() - last) < 6 * 3600:
         return
-    prompt = "Es por la mañana. Mándale un buenos días a Gabriel de forma natural y corta, como lo harías tú. Puedes preguntarle cómo durmió o qué tiene planeado, pero no siempre."
-    await send_reze_message(context.bot, MY_CHAT_ID, prompt)
+    await send_reze_message(context.bot, MY_CHAT_ID,
+        "Es por la mañana. Mándale un buenos días a Gabriel, corto y natural. Puedes preguntarle cómo durmió o qué tiene planeado, pero no siempre.")
 
-async def job_buenas_noches(context: ContextTypes.DEFAULT_TYPE):
+async def job_buenas_noches(context):
     now_pr = datetime.now(PR_TZ)
-    # Buenas noches entre 10:00 PM y 11:30 PM
     if not (22 <= now_pr.hour < 24):
         return
     last = get_last_reze_proactive(MY_CHAT_ID)
     if last and (datetime.now(timezone.utc).timestamp() - last) < 4 * 3600:
         return
-    prompt = "Es tarde en la noche. Mándale buenas noches a Gabriel de forma natural. Puedes decirle que descanse o preguntarle si va a dormir ya. Corto y casual."
-    await send_reze_message(context.bot, MY_CHAT_ID, prompt)
+    await send_reze_message(context.bot, MY_CHAT_ID,
+        "Es tarde en la noche. Mándale buenas noches a Gabriel, corto y casual. Puedes decirle que descanse o preguntarle si va a dormir ya.")
 
-async def job_proactivo(context: ContextTypes.DEFAULT_TYPE):
-    """Mensajes aleatorios — si lleva mucho sin escribir o Reze está 'aburrida'."""
+async def job_proactivo(context):
     now_pr = datetime.now(PR_TZ)
-    # No molestar entre medianoche y 8am
-    if now_pr.hour < 8 or now_pr.hour >= 24:
+    if now_pr.hour < 8 or now_pr.hour >= 23:
         return
-
     last_user = get_last_user_msg_time(MY_CHAT_ID)
     last_proactive = get_last_reze_proactive(MY_CHAT_ID)
     now_ts = datetime.now(timezone.utc).timestamp()
-
-    # Necesita al menos 45 min desde último mensaje del usuario
     if last_user and (now_ts - last_user) < 45 * 60:
         return
-    # Y al menos 1 hora desde último mensaje proactivo
     if last_proactive and (now_ts - last_proactive) < 60 * 60:
         return
-
-    # Probabilidad aleatoria — no siempre escribe aunque pasen las condiciones
     if random.random() > 0.4:
         return
-
     prompts = [
-        "Gabriel lleva un rato sin escribirte. Escríbele algo casual — puede ser que estás aburrida, que pensaste en él, que viste algo gracioso, o simplemente preguntarle qué está haciendo. Sé natural.",
-        "Se te ocurrió algo y quieres contárselo a Gabriel. Invéntate algo cotidiano — algo que pasó, algo que viste, algo que te dio risa. Corto y natural.",
-        "Tienes ganas de hablar con Gabriel. Escríbele algo sin razón específica, como se hace cuando extrañas a alguien sin querer admitirlo.",
-        "Pregúntale a Gabriel si comió, cómo va su día, o si está bien. De forma directa pero sin exagerar la preocupación.",
+        "Gabriel lleva un rato sin escribirte. Escríbele algo casual — que estás aburrida, que pensaste en él, algo gracioso, o preguntarle qué hace. Natural y corto.",
+        "Se te ocurrió algo y quieres contárselo a Gabriel. Algo cotidiano — algo que pasó, que viste, que te dio risa. Corto.",
+        "Tienes ganas de hablar con Gabriel. Escríbele algo sin razón específica, como cuando extrañas a alguien sin querer admitirlo.",
+        "Pregúntale a Gabriel si comió, cómo va su día, o si está bien. Directo pero sin exagerar.",
+        "Estás pensando en Gabriel y te pones coqueta. Escríbele algo atrevido o con doble sentido, casual y corto.",
     ]
     await send_reze_message(context.bot, MY_CHAT_ID, random.choice(prompts))
 
-async def job_insistir(context: ContextTypes.DEFAULT_TYPE):
-    """Si Reze mandó un mensaje proactivo y Gabriel no respondió en 30-60 min, insiste una vez."""
+async def job_insistir(context):
     last_proactive = get_last_reze_proactive(MY_CHAT_ID)
     last_user = get_last_user_msg_time(MY_CHAT_ID)
     now_ts = datetime.now(timezone.utc).timestamp()
-
     if not last_proactive:
         return
-    # Reze mandó mensaje hace 30-90 min
-    tiempo_desde_proactivo = now_ts - last_proactive
-    if not (30 * 60 < tiempo_desde_proactivo < 90 * 60):
+    tiempo = now_ts - last_proactive
+    if not (30 * 60 < tiempo < 90 * 60):
         return
-    # Gabriel no ha respondido desde entonces
     if last_user and last_user > last_proactive:
         return
-    # Solo insiste si no ha insistido ya (marca en redis)
     ya_insistio = redis_client.get(f"insistio:{MY_CHAT_ID}")
     if ya_insistio:
         return
-
     redis_client.setex(f"insistio:{MY_CHAT_ID}", 3600 * 4, "1")
-    prompt = "Le mandaste un mensaje a Gabriel hace un rato y no ha respondido. Insiste una vez, de forma corta — puede ser un 'oye' o un 'me ignoraste' o algo por el estilo. Natural, sin drama."
-    await send_reze_message(context.bot, MY_CHAT_ID, prompt)
+    await send_reze_message(context.bot, MY_CHAT_ID,
+        "Le mandaste un mensaje a Gabriel hace rato y no respondió. Insiste una vez, muy corto — un 'oye' o 'me ignoraste' o algo así.")
 
 # ─── HANDLER PRINCIPAL ────────────────────────────────────────────
 async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -265,7 +262,6 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_message = update.message.text
     set_last_user_msg_time(chat_id)
-    # Resetear flag de insistencia cuando Gabriel responde
     redis_client.delete(f"insistio:{chat_id}")
 
     history = get_history(chat_id)
@@ -280,13 +276,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
     try:
-        completion = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=messages,
-            temperature=0.9,
-            max_tokens=400,
-        )
-        respuesta_completa = completion.choices[0].message.content
+        respuesta_completa = together_complete(messages, temperature=0.9, max_tokens=400)
         history.append({"role": "assistant", "content": respuesta_completa})
         save_history(chat_id, history)
 
@@ -312,10 +302,10 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, responder))
 
     jq = app.job_queue
-    jq.run_repeating(job_buenos_dias,   interval=600,  first=10)   # cada 10 min
+    jq.run_repeating(job_buenos_dias,   interval=600,  first=10)
     jq.run_repeating(job_buenas_noches, interval=600,  first=15)
-    jq.run_repeating(job_proactivo,     interval=1800, first=60)   # cada 30 min
-    jq.run_repeating(job_insistir,      interval=900,  first=30)   # cada 15 min
+    jq.run_repeating(job_proactivo,     interval=1800, first=60)
+    jq.run_repeating(job_insistir,      interval=900,  first=30)
 
     print("Reze está online...")
     app.run_polling()
