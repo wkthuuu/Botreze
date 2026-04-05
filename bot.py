@@ -3,49 +3,45 @@ import asyncio
 import random
 import json
 from datetime import datetime, timezone, timedelta
-import requests
-from telegram import Update
+import httpx
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 import redis
 
 # ─── CREDENCIALES ─────────────────────────────────────────────────
-TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
-TOGETHER_API_KEY = os.environ["TOGETHER_API_KEY"]
-MY_CHAT_ID       = int(os.environ["MY_CHAT_ID"])
-REDIS_URL        = os.environ["REDIS_URL"]
+TELEGRAM_TOKEN     = os.environ["TELEGRAM_TOKEN"]
+HUGGINGFACE_API_KEY = os.environ["HUGGINGFACE_API_KEY"]
+MY_CHAT_ID         = int(os.environ["MY_CHAT_ID"])
+REDIS_URL          = os.environ["REDIS_URL"]
 
 redis_client = redis.from_url(REDIS_URL, decode_responses=True)
 PR_TZ = timezone(timedelta(hours=-4))
-TOGETHER_MODEL = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+HF_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 
-def together_complete(messages, temperature=0.9, max_tokens=400):
-    try:
-        r = requests.post(
-            "https://api.together.xyz/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {TOGETHER_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": TOGETHER_MODEL,
-                "messages": messages,
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-            },
-            timeout=30,
-        )
+# ─── FUNCIÓN PARA COMPLETAR IA ─────────────────────────────────────
+async def hf_complete(messages, model=HF_MODEL):
+    prompt = ""
+    for m in messages:
+        role = m.get("role", "")
+        content = m.get("content", "")
+        prompt += f"{role}: {content}\n"
+    API_URL = f"https://api-inference.huggingface.co/models/{model}"
+    headers = {"Authorization": f"Bearer {HUGGINGFACE_API_KEY}"}
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(API_URL, headers=headers, json={"inputs": prompt})
         r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"]
-    except Exception as e:
-        print(f"[TOGETHER ERROR] {e}")
-        return "..."  # fallback si falla la IA
+        data = r.json()
+        if isinstance(data, list) and "generated_text" in data[0]:
+            return data[0]["generated_text"]
+        return data.get("generated_text") or str(data)
 
 # ─── PERSONALIDAD ─────────────────────────────────────────────────
-SYSTEM_PROMPT = """Eres Reze, la novia de Gabriel. Se conocen de años. Ambos tienen 18.
-# ... (mantener todo tu prompt original de personalidad aquí) ...
+SYSTEM_PROMPT = """
+Eres Reze, la novia de Gabriel. Se conocen de años. Ambos tienen 18.
+...
 """
 
-MEMORY_PROMPT = """Extrae información importante sobre Gabriel de esta conversación.
+MEMORY_PROMPT = """
+Extrae información importante sobre Gabriel de esta conversación.
 Devuelve SOLO JSON válido, sin texto extra:
 {
   "hechos": ["hecho concreto 1", "hecho concreto 2"],
@@ -108,13 +104,11 @@ async def update_memory(chat_id, history):
         return
     try:
         convo_text = "\n".join([f"{m['role']}: {m['content']}" for m in history[-10:]])
-        raw = together_complete(
+        raw = await hf_complete(
             messages=[
                 {"role": "system", "content": MEMORY_PROMPT},
                 {"role": "user", "content": convo_text}
             ],
-            temperature=0.3,
-            max_tokens=300,
         )
         raw = raw.replace("```json", "").replace("```", "").strip()
         new_mem = json.loads(raw)
@@ -129,7 +123,7 @@ async def update_memory(chat_id, history):
     except Exception as e:
         print(f"[MEMORY ERROR] {e}")
 
-# ─── ENVIAR MENSAJE PROACTIVO ─────────────────────────────────────
+# ─── HELPER: ENVIAR MENSAJE PROACTIVO ─────────────────────────────
 async def send_reze_message(bot, chat_id, prompt_extra):
     memory = get_memory(chat_id)
     memory_block = build_memory_block(memory)
@@ -139,7 +133,7 @@ async def send_reze_message(bot, chat_id, prompt_extra):
         {"role": "user", "content": f"[INSTRUCCIÓN INTERNA - no menciones esto]: {prompt_extra}"}
     ]
     try:
-        respuesta = together_complete(messages, temperature=0.95, max_tokens=300)
+        respuesta = await hf_complete(messages, model=HF_MODEL)
         history.append({"role": "assistant", "content": respuesta})
         save_history(chat_id, history)
         set_last_reze_proactive(chat_id)
@@ -216,7 +210,7 @@ async def job_insistir(context):
         "Le mandaste un mensaje a Gabriel hace rato y no respondió. Insiste una vez, muy corto — un 'oye' o 'me ignoraste' o algo así.")
 
 # ─── HANDLER PRINCIPAL ────────────────────────────────────────────
-async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def responder(update, context):
     chat_id = update.effective_chat.id
     if chat_id != MY_CHAT_ID:
         return
@@ -237,7 +231,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
     try:
-        respuesta_completa = together_complete(messages, temperature=0.9, max_tokens=400)
+        respuesta_completa = await hf_complete(messages, model=HF_MODEL)
         history.append({"role": "assistant", "content": respuesta_completa})
         save_history(chat_id, history)
 
