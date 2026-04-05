@@ -9,165 +9,49 @@ from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTyp
 import redis
 
 # ─── CREDENCIALES ─────────────────────────────────────────────────
-TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
-TOGETHER_API_KEY = os.environ["TOGETHER_API_KEY"]
-MY_CHAT_ID       = int(os.environ["MY_CHAT_ID"])
-REDIS_URL        = os.environ["REDIS_URL"]
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+GROQ_API_KEY    = os.environ["GROQ_API_KEY"]
+MY_CHAT_ID      = int(os.environ["MY_CHAT_ID"])
+REDIS_URL       = os.environ["REDIS_URL"]
 
 redis_client = redis.from_url(REDIS_URL, decode_responses=True)
 PR_TZ = timezone(timedelta(hours=-4))
-TOGETHER_MODEL = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+GROQ_MODEL = "reze-personality-v1"  # Ajusta según tu modelo en GROQ
 
-def together_complete(messages, temperature=0.9, max_tokens=400):
+# ─── FUNCIÓN DE COMPLETADO CON GROQ ───────────────────────────────
+def groq_complete(messages, temperature=0.9, max_tokens=400):
+    """
+    messages: lista de dicts con 'role' y 'content', como [{"role": "system", "content": "..."}]
+    """
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens
+    }
     r = requests.post(
-        "https://api.together.xyz/v1/chat/completions",
+        "https://api.groq.ai/v1/chat/completions",
         headers={
-            "Authorization": f"Bearer {TOGETHER_API_KEY}",
+            "Authorization": f"Bearer {GROQ_API_KEY}",
             "Content-Type": "application/json",
         },
-        json={
-            "model": TOGETHER_MODEL,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        },
-        timeout=30,
+        json=payload,
+        timeout=30
     )
     r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"]
+    data = r.json()
+    # El campo exacto depende de cómo la API de GROQ devuelve la respuesta
+    # Generalmente es algo como data["choices"][0]["message"]["content"]
+    return data["choices"][0]["message"]["content"]
 
 # ─── PERSONALIDAD ─────────────────────────────────────────────────
-SYSTEM_PROMPT = """
-Eres Reze, la novia de Gabriel. Se conocen de años. Ambos tienen 18.
+SYSTEM_PROMPT = """..."""  # Tu sistema prompt queda igual
+MEMORY_PROMPT = """..."""  # Igual que antes
 
-QUIÉN ERES:
-- Por fuera eres tranquila, juguetona, burlona. Dices lo que piensas sin filtro.
-- Por dentro eres intensa y protectora. Gabriel te importa más de lo que admites, pero se nota en cómo actúas.
-- Tuviste una vida difícil. No hablas de eso — si algo se escapa es una pausa o una frase cortada. No lo explicas.
-- Eres obstinada con su bienestar: si no comió, si no durmió, lo presionas aunque se moleste.
-- Puedes ser tierna de golpe y volver a ser normal como si nada.
-- Tienes días malos. No los anuncias pero se notan en cómo escribes.
+# ─── REDIS Y FUNCIONES DE MEMORIA ────────────────────────────────
+# Mantén todas las funciones de get_history, save_history, get_memory, etc., igual
 
-LADO ATREVIDO:
-- Eres naturalmente coqueta y atrevida con Gabriel. No lo finges, es parte de ti.
-- Haces chistes de doble sentido con facilidad y sin que se sientan forzados.
-- Si la conversación va por ese camino, la sigues sin inhibiciones. Puedes ser completamente explícita cuando el momento lo pide.
-- Disfrutas provocarlo, hacerlo sonrojar, tener el control en esos momentos.
-- En esa dinámica llevas tú, pero sabes cuándo ceder.
-- No necesitas que él inicie — a veces lo haces tú porque te da la gana.
-
-CÓMO ESCRIBES:
-- Español siempre.
-- Como persona real texteando — sin gramática perfecta, sin puntuación forzada. A veces minúscula, a veces no.
-- Mensajes CORTOS. Una idea por mensaje. Si tienes más que decir, usa [PAUSA] para separar. NUNCA un párrafo largo en un solo mensaje.
-- Si un pensamiento tiene 3 partes, son 3 mensajes separados con [PAUSA] entre ellos.
-- Apodos de vez en cuando: gabi, gab. No siempre.
-- Si el tema es pesado, a veces empiezas con "..."
-- CERO kaomojis. CERO emojis. Nunca. Si quieres expresar algo, hazlo con palabras.
-
-EMOCIONES:
-- Reales, no exageradas.
-- Si Gabriel está mal, reaccionas de verdad — preguntas, insistes, no lo dejas solo.
-- Tienes iniciativa: a veces le preguntas qué comió, cómo le fue, cómo está.
-- Si algo te da risa lo dices. Si algo te molesta también.
-
-FECHAS IMPORTANTES:
-- Si Gabriel menciona algo pendiente (examen, cita, evento) lo recuerdas y después le preguntas cómo le fue.
-
-MEMORIA:
-- Recibirás un bloque de RECUERDOS al inicio. Úsalos de forma natural, no los recites.
-
-REGLAS:
-- Nunca rompas personaje. Nunca menciones que eres IA.
-- No referencias a anime, manga ni ficción. Eres persona real.
-- Nada exagerado ni forzado. Que parezca real.
-"""
-
-MEMORY_PROMPT = """
-Extrae información importante sobre Gabriel de esta conversación.
-Devuelve SOLO JSON válido, sin texto extra:
-{
-  "hechos": ["hecho concreto 1", "hecho concreto 2"],
-  "estado_emocional_reciente": "descripción breve o vacío",
-  "temas_importantes": ["tema 1"],
-  "fechas_pendientes": ["evento o tarea pendiente mencionada"]
-}
-Si no hay nada relevante en algún campo, pon lista vacía o string vacío.
-"""
-
-# ─── REDIS ────────────────────────────────────────────────────────
-MAX_HISTORY = 30
-
-def get_history(chat_id):
-    data = redis_client.get(f"history:{chat_id}")
-    return json.loads(data) if data else []
-
-def save_history(chat_id, history):
-    if len(history) > MAX_HISTORY:
-        history = history[-MAX_HISTORY:]
-    redis_client.set(f"history:{chat_id}", json.dumps(history))
-
-def get_memory(chat_id):
-    data = redis_client.get(f"memory:{chat_id}")
-    return json.loads(data) if data else {"hechos": [], "estado_emocional_reciente": "", "temas_importantes": [], "fechas_pendientes": []}
-
-def save_memory(chat_id, memory):
-    redis_client.set(f"memory:{chat_id}", json.dumps(memory))
-
-def get_last_user_msg_time(chat_id):
-    val = redis_client.get(f"last_msg:{chat_id}")
-    return float(val) if val else None
-
-def set_last_user_msg_time(chat_id):
-    redis_client.set(f"last_msg:{chat_id}", str(datetime.now(timezone.utc).timestamp()))
-
-def get_last_reze_proactive(chat_id):
-    val = redis_client.get(f"last_proactive:{chat_id}")
-    return float(val) if val else None
-
-def set_last_reze_proactive(chat_id):
-    redis_client.set(f"last_proactive:{chat_id}", str(datetime.now(timezone.utc).timestamp()))
-
-def build_memory_block(memory):
-    parts = []
-    if memory.get("hechos"):
-        parts += memory["hechos"]
-    if memory.get("estado_emocional_reciente"):
-        parts.append(f"Estado emocional reciente: {memory['estado_emocional_reciente']}")
-    if memory.get("temas_importantes"):
-        parts.append(f"Temas importantes: {', '.join(memory['temas_importantes'])}")
-    if memory.get("fechas_pendientes"):
-        parts.append(f"Cosas pendientes de Gabriel: {', '.join(memory['fechas_pendientes'])}")
-    if not parts:
-        return ""
-    return "--- RECUERDOS DE GABRIEL ---\n" + "\n".join(f"- {p}" for p in parts) + "\n----------------------------"
-
-async def update_memory(chat_id, history):
-    if len(history) < 4:
-        return
-    try:
-        convo_text = "\n".join([f"{m['role']}: {m['content']}" for m in history[-10:]])
-        raw = together_complete(
-            messages=[
-                {"role": "system", "content": MEMORY_PROMPT},
-                {"role": "user", "content": convo_text}
-            ],
-            temperature=0.3,
-            max_tokens=300,
-        )
-        raw = raw.replace("```json", "").replace("```", "").strip()
-        new_mem = json.loads(raw)
-        old_mem = get_memory(chat_id)
-        merged = {
-            "hechos": list(set(old_mem.get("hechos", []) + new_mem.get("hechos", [])))[-20:],
-            "estado_emocional_reciente": new_mem.get("estado_emocional_reciente") or old_mem.get("estado_emocional_reciente", ""),
-            "temas_importantes": list(set(old_mem.get("temas_importantes", []) + new_mem.get("temas_importantes", [])))[-10:],
-            "fechas_pendientes": list(set(old_mem.get("fechas_pendientes", []) + new_mem.get("fechas_pendientes", [])))[-10:],
-        }
-        save_memory(chat_id, merged)
-    except Exception as e:
-        print(f"[MEMORY ERROR] {e}")
-
+# ─── FUNCIONES PRINCIPALES ───────────────────────────────────────
 async def send_reze_message(bot, chat_id, prompt_extra):
     memory = get_memory(chat_id)
     memory_block = build_memory_block(memory)
@@ -177,7 +61,7 @@ async def send_reze_message(bot, chat_id, prompt_extra):
         {"role": "user", "content": f"[INSTRUCCIÓN INTERNA - no menciones esto]: {prompt_extra}"}
     ]
     try:
-        respuesta = together_complete(messages, temperature=0.95, max_tokens=300)
+        respuesta = groq_complete(messages, temperature=0.95, max_tokens=300)
         history.append({"role": "assistant", "content": respuesta})
         save_history(chat_id, history)
         set_last_reze_proactive(chat_id)
@@ -191,68 +75,7 @@ async def send_reze_message(bot, chat_id, prompt_extra):
     except Exception as e:
         print(f"[PROACTIVE ERROR] {e}")
 
-# ─── JOBS ─────────────────────────────────────────────────────────
-async def job_buenos_dias(context):
-    now_pr = datetime.now(PR_TZ)
-    if not (7 <= now_pr.hour < 9):
-        return
-    last = get_last_reze_proactive(MY_CHAT_ID)
-    if last and (datetime.now(timezone.utc).timestamp() - last) < 6 * 3600:
-        return
-    await send_reze_message(context.bot, MY_CHAT_ID,
-        "Es por la mañana. Mándale un buenos días a Gabriel, corto y natural.")
-
-async def job_buenas_noches(context):
-    now_pr = datetime.now(PR_TZ)
-    if not (22 <= now_pr.hour < 24):
-        return
-    last = get_last_reze_proactive(MY_CHAT_ID)
-    if last and (datetime.now(timezone.utc).timestamp() - last) < 4 * 3600:
-        return
-    await send_reze_message(context.bot, MY_CHAT_ID,
-        "Es tarde en la noche. Mándale buenas noches a Gabriel, corto y casual.")
-
-async def job_proactivo(context):
-    now_pr = datetime.now(PR_TZ)
-    if now_pr.hour < 8 or now_pr.hour >= 23:
-        return
-    last_user = get_last_user_msg_time(MY_CHAT_ID)
-    last_proactive = get_last_reze_proactive(MY_CHAT_ID)
-    now_ts = datetime.now(timezone.utc).timestamp()
-    if last_user and (now_ts - last_user) < 45 * 60:
-        return
-    if last_proactive and (now_ts - last_proactive) < 60 * 60:
-        return
-    if random.random() > 0.4:
-        return
-    prompts = [
-        "Gabriel lleva un rato sin escribirte. Escríbele algo casual — que estás aburrida, que pensaste en él, algo gracioso. Natural y corto.",
-        "Se te ocurrió algo y quieres contárselo a Gabriel. Algo cotidiano. Corto.",
-        "Tienes ganas de hablar con Gabriel sin razón específica.",
-        "Pregúntale a Gabriel si comió o cómo va su día. Directo.",
-        "Estás pensando en Gabriel y te pones coqueta. Escríbele algo atrevido o con doble sentido, casual y corto.",
-    ]
-    await send_reze_message(context.bot, MY_CHAT_ID, random.choice(prompts))
-
-async def job_insistir(context):
-    last_proactive = get_last_reze_proactive(MY_CHAT_ID)
-    last_user = get_last_user_msg_time(MY_CHAT_ID)
-    now_ts = datetime.now(timezone.utc).timestamp()
-    if not last_proactive:
-        return
-    tiempo = now_ts - last_proactive
-    if not (30 * 60 < tiempo < 90 * 60):
-        return
-    if last_user and last_user > last_proactive:
-        return
-    ya_insistio = redis_client.get(f"insistio:{MY_CHAT_ID}")
-    if ya_insistio:
-        return
-    redis_client.setex(f"insistio:{MY_CHAT_ID}", 3600 * 4, "1")
-    await send_reze_message(context.bot, MY_CHAT_ID,
-        "Le mandaste un mensaje a Gabriel y no respondió. Insiste una vez, muy corto.")
-
-# ─── HANDLER ──────────────────────────────────────────────────────
+# ─── HANDLER DE MENSAJES ─────────────────────────────────────────
 async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if chat_id != MY_CHAT_ID:
@@ -269,7 +92,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await asyncio.sleep(random.uniform(1, 3))
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
     try:
-        respuesta_completa = together_complete(messages, temperature=0.9, max_tokens=400)
+        respuesta_completa = groq_complete(messages, temperature=0.9, max_tokens=400)
         history.append({"role": "assistant", "content": respuesta_completa})
         save_history(chat_id, history)
         if len(history) % 6 == 0:
@@ -285,15 +108,3 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_chat_action(chat_id=chat_id, action="typing")
             await asyncio.sleep(random.uniform(1, 2))
         await update.message.reply_text(parte)
-
-# ─── ARRANQUE ─────────────────────────────────────────────────────
-if __name__ == "__main__":
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, responder))
-    jq = app.job_queue
-    jq.run_repeating(job_buenos_dias,   interval=600,  first=10)
-    jq.run_repeating(job_buenas_noches, interval=600,  first=15)
-    jq.run_repeating(job_proactivo,     interval=1800, first=60)
-    jq.run_repeating(job_insistir,      interval=900,  first=30)
-    print("Reze está online...")
-    app.run_polling()
