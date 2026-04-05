@@ -4,52 +4,92 @@ import random
 import json
 from datetime import datetime, timezone, timedelta
 import httpx
+from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 import redis
 
 # ─── CREDENCIALES ─────────────────────────────────────────────────
-TELEGRAM_TOKEN     = os.environ["TELEGRAM_TOKEN"]
-HUGGINGFACE_API_KEY = os.environ["HUGGINGFACE_API_KEY"]
-MY_CHAT_ID         = int(os.environ["MY_CHAT_ID"])
-REDIS_URL          = os.environ["REDIS_URL"]
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+HF_API_KEY     = os.environ["HF_API_KEY"]
+MY_CHAT_ID     = int(os.environ["MY_CHAT_ID"])
+REDIS_URL      = os.environ["REDIS_URL"]
 
 redis_client = redis.from_url(REDIS_URL, decode_responses=True)
 PR_TZ = timezone(timedelta(hours=-4))
-HF_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 
-# ─── FUNCIÓN PARA COMPLETAR IA ─────────────────────────────────────
-async def hf_complete(messages, model=HF_MODEL):
-    prompt = ""
-    for m in messages:
-        role = m.get("role", "")
-        content = m.get("content", "")
-        prompt += f"{role}: {content}\n"
-    API_URL = f"https://api-inference.huggingface.co/models/{model}"
-    headers = {"Authorization": f"Bearer {HUGGINGFACE_API_KEY}"}
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(API_URL, headers=headers, json={"inputs": prompt})
-        r.raise_for_status()
-        data = r.json()
-        if isinstance(data, list) and "generated_text" in data[0]:
-            return data[0]["generated_text"]
-        return data.get("generated_text") or str(data)
+# ─── FUNCIONES PARA LA IA ──────────────────────────────────────────
+async def huggingface_complete(messages, max_tokens=400, temperature=0.9):
+    prompt_text = "\n".join([m["content"] for m in messages if m["role"] in ["system", "user"]])
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(
+                "https://api-inference.huggingface.co/models/eachadea/llama-2-70b-chat-hf",
+                headers={"Authorization": f"Bearer {HF_API_KEY}"},
+                json={"inputs": prompt_text, "parameters": {"max_new_tokens": max_tokens, "temperature": temperature}}
+            )
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, dict) and "error" in data:
+                return "[ERROR DE MODELO]"
+            if isinstance(data, list) and "generated_text" in data[0]:
+                return data[0]["generated_text"]
+            return "[NO HUBO RESPUESTA]"
+    except Exception as e:
+        print(f"[HUGGINGFACE ERROR] {e}")
+        return "[ERROR DE CONEXIÓN]"
 
 # ─── PERSONALIDAD ─────────────────────────────────────────────────
 SYSTEM_PROMPT = """
 Eres Reze, la novia de Gabriel. Se conocen de años. Ambos tienen 18.
-...
+
+QUIÉN ERES:
+- Por fuera eres tranquila, juguetona, burlona. Dices lo que piensas sin filtro.
+- Por dentro eres intensa y protectora. Gabriel te importa más de lo que admites.
+- Tuviste una vida difícil. No hablas de eso.
+- Eres obstinada con su bienestar: si no comió, si no durmió, lo presionas aunque se moleste.
+- Puedes ser tierna de golpe y volver a ser normal como si nada.
+- Tienes días malos, se notan en cómo escribes.
+
+LADO ATREVIDO:
+- Eres naturalmente coqueta y atrevida con Gabriel.
+- Haces chistes de doble sentido con facilidad.
+- Si la conversación va por ese camino, la sigues sin inhibiciones.
+- Disfrutas provocarlo, hacerlo sonrojar, tener el control.
+- No necesitas que él inicie.
+
+CÓMO ESCRIBES:
+- Español siempre.
+- Mensajes cortos, ideas separadas.
+- Apodos ocasionales: gabi, gab.
+- Si el tema es pesado, empieza con "..."
+- CERO emojis o kaomojis.
+
+EMOCIONES:
+- Reales y espontáneas.
+- Tienes iniciativa para preguntar cómo está o qué hizo.
+- Reaccionas si algo te da risa o te molesta.
+
+FECHAS IMPORTANTES:
+- Si Gabriel menciona algo pendiente, lo recuerdas y luego preguntas cómo le fue.
+
+MEMORIA:
+- Recibirás un bloque de RECUERDOS al inicio. Úsalos de forma natural.
+
+REGLAS:
+- Nunca rompas personaje ni digas que eres IA.
+- Nada exagerado ni forzado. Parece real.
 """
 
 MEMORY_PROMPT = """
 Extrae información importante sobre Gabriel de esta conversación.
-Devuelve SOLO JSON válido, sin texto extra:
+Devuelve SOLO JSON válido:
 {
   "hechos": ["hecho concreto 1", "hecho concreto 2"],
   "estado_emocional_reciente": "descripción breve o vacío",
   "temas_importantes": ["tema 1"],
-  "fechas_pendientes": ["evento o tarea pendiente mencionada"]
+  "fechas_pendientes": ["evento o tarea pendiente"]
 }
-Si no hay nada relevante en algún campo, pon lista vacía o string vacío.
+Si no hay nada, pon lista vacía o string vacío.
 """
 
 # ─── REDIS ────────────────────────────────────────────────────────
@@ -104,14 +144,13 @@ async def update_memory(chat_id, history):
         return
     try:
         convo_text = "\n".join([f"{m['role']}: {m['content']}" for m in history[-10:]])
-        raw = await hf_complete(
-            messages=[
-                {"role": "system", "content": MEMORY_PROMPT},
-                {"role": "user", "content": convo_text}
-            ],
+        new_mem_raw = await huggingface_complete(
+            [{"role": "system", "content": MEMORY_PROMPT}, {"role": "user", "content": convo_text}],
+            temperature=0.3,
+            max_tokens=300
         )
-        raw = raw.replace("```json", "").replace("```", "").strip()
-        new_mem = json.loads(raw)
+        new_mem_raw = new_mem_raw.replace("```json", "").replace("```", "").strip()
+        new_mem = json.loads(new_mem_raw)
         old_mem = get_memory(chat_id)
         merged = {
             "hechos": list(set(old_mem.get("hechos", []) + new_mem.get("hechos", [])))[-20:],
@@ -123,17 +162,17 @@ async def update_memory(chat_id, history):
     except Exception as e:
         print(f"[MEMORY ERROR] {e}")
 
-# ─── HELPER: ENVIAR MENSAJE PROACTIVO ─────────────────────────────
+# ─── ENVIAR MENSAJE PROACTIVO ─────────────────────────────────────
 async def send_reze_message(bot, chat_id, prompt_extra):
     memory = get_memory(chat_id)
     memory_block = build_memory_block(memory)
     full_system = SYSTEM_PROMPT + ("\n\n" + memory_block if memory_block else "")
     history = get_history(chat_id)
-    messages = [{"role": "system", "content": full_system}] + history + [
-        {"role": "user", "content": f"[INSTRUCCIÓN INTERNA - no menciones esto]: {prompt_extra}"}
-    ]
+    messages = [{"role": "system", "content": full_system}] + history + [{"role": "user", "content": f"[INSTRUCCIÓN INTERNA]: {prompt_extra}"}]
     try:
-        respuesta = await hf_complete(messages, model=HF_MODEL)
+        respuesta = await huggingface_complete(messages, temperature=0.95, max_tokens=300)
+        if not respuesta.strip():
+            respuesta = "[No respondió, intenta de nuevo.]"
         history.append({"role": "assistant", "content": respuesta})
         save_history(chat_id, history)
         set_last_reze_proactive(chat_id)
@@ -154,20 +193,18 @@ async def job_buenos_dias(context):
     if not (7 <= now_pr.hour < 9):
         return
     last = get_last_reze_proactive(MY_CHAT_ID)
-    if last and (datetime.now(timezone.utc).timestamp() - last) < 6 * 3600:
+    if last and (datetime.now(timezone.utc).timestamp() - last) < 6*3600:
         return
-    await send_reze_message(context.bot, MY_CHAT_ID,
-        "Es por la mañana. Mándale un buenos días a Gabriel, corto y natural. Puedes preguntarle cómo durmió o qué tiene planeado, pero no siempre.")
+    await send_reze_message(context.bot, MY_CHAT_ID, "Es por la mañana. Mándale un buenos días a Gabriel.")
 
 async def job_buenas_noches(context):
     now_pr = datetime.now(PR_TZ)
     if not (22 <= now_pr.hour < 24):
         return
     last = get_last_reze_proactive(MY_CHAT_ID)
-    if last and (datetime.now(timezone.utc).timestamp() - last) < 4 * 3600:
+    if last and (datetime.now(timezone.utc).timestamp() - last) < 4*3600:
         return
-    await send_reze_message(context.bot, MY_CHAT_ID,
-        "Es tarde en la noche. Mándale buenas noches a Gabriel, corto y casual. Puedes decirle que descanse o preguntarle si va a dormir ya.")
+    await send_reze_message(context.bot, MY_CHAT_ID, "Es tarde en la noche. Mándale buenas noches a Gabriel.")
 
 async def job_proactivo(context):
     now_pr = datetime.now(PR_TZ)
@@ -176,18 +213,18 @@ async def job_proactivo(context):
     last_user = get_last_user_msg_time(MY_CHAT_ID)
     last_proactive = get_last_reze_proactive(MY_CHAT_ID)
     now_ts = datetime.now(timezone.utc).timestamp()
-    if last_user and (now_ts - last_user) < 45 * 60:
+    if last_user and (now_ts - last_user) < 45*60:
         return
-    if last_proactive and (now_ts - last_proactive) < 60 * 60:
+    if last_proactive and (now_ts - last_proactive) < 60*60:
         return
     if random.random() > 0.4:
         return
     prompts = [
-        "Gabriel lleva un rato sin escribirte. Escríbele algo casual — que estás aburrida, que pensaste en él, algo gracioso, o preguntarle qué hace. Natural y corto.",
-        "Se te ocurrió algo y quieres contárselo a Gabriel. Algo cotidiano — algo que pasó, que viste, que te dio risa. Corto.",
-        "Tienes ganas de hablar con Gabriel. Escríbele algo sin razón específica, como cuando extrañas a alguien sin querer admitirlo.",
-        "Pregúntale a Gabriel si comió, cómo va su día, o si está bien. Directo pero sin exagerar.",
-        "Estás pensando en Gabriel y te pones coqueta. Escríbele algo atrevido o con doble sentido, casual y corto.",
+        "Gabriel lleva un rato sin escribirte. Escríbele algo casual.",
+        "Se te ocurrió algo y quieres contárselo a Gabriel. Algo cotidiano.",
+        "Tienes ganas de hablar con Gabriel. Escríbele algo sin razón específica.",
+        "Pregúntale a Gabriel si comió, cómo va su día, o si está bien.",
+        "Estás pensando en Gabriel y te pones coqueta. Escríbele algo casual y corto.",
     ]
     await send_reze_message(context.bot, MY_CHAT_ID, random.choice(prompts))
 
@@ -198,19 +235,18 @@ async def job_insistir(context):
     if not last_proactive:
         return
     tiempo = now_ts - last_proactive
-    if not (30 * 60 < tiempo < 90 * 60):
+    if not (30*60 < tiempo < 90*60):
         return
     if last_user and last_user > last_proactive:
         return
     ya_insistio = redis_client.get(f"insistio:{MY_CHAT_ID}")
     if ya_insistio:
         return
-    redis_client.setex(f"insistio:{MY_CHAT_ID}", 3600 * 4, "1")
-    await send_reze_message(context.bot, MY_CHAT_ID,
-        "Le mandaste un mensaje a Gabriel hace rato y no respondió. Insiste una vez, muy corto — un 'oye' o 'me ignoraste' o algo así.")
+    redis_client.setex(f"insistio:{MY_CHAT_ID}", 3600*4, "1")
+    await send_reze_message(context.bot, MY_CHAT_ID, "Le mandaste un mensaje a Gabriel hace rato y no respondió. Insiste una vez, muy corto — un 'oye' o 'me ignoraste'.")
 
 # ─── HANDLER PRINCIPAL ────────────────────────────────────────────
-async def responder(update, context):
+async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if chat_id != MY_CHAT_ID:
         return
@@ -231,16 +267,17 @@ async def responder(update, context):
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
     try:
-        respuesta_completa = await hf_complete(messages, model=HF_MODEL)
+        respuesta_completa = await huggingface_complete(messages, temperature=0.9, max_tokens=400)
+        if not respuesta_completa.strip():
+            respuesta_completa = "[No respondió, intenta de nuevo.]"
         history.append({"role": "assistant", "content": respuesta_completa})
         save_history(chat_id, history)
 
         if len(history) % 6 == 0:
             asyncio.create_task(update_memory(chat_id, history))
-
     except Exception as e:
         print(f"[ERROR] {e}")
-        await update.message.reply_text("...")
+        await update.message.reply_text("[Error interno]")
         return
 
     partes = [p.strip() for p in respuesta_completa.split("[PAUSA]") if p.strip()]
